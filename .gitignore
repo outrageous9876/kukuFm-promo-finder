@@ -11,5 +11,7 @@ notes*.txt
 !requirements.txt
 # Secrets
 .env
-# Python cache
+# Python cache and virtual environments
 __pycache__/
+.venv/
+venv/

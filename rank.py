@@ -1,15 +1,12 @@
-"""Step 4: rank promo candidates with a tournament judged by Gemini.   python rank.py outputs/"""
+"""Step 4: rank promo candidates with a tournament judged by the model.   python rank.py outputs/"""
 import csv
 import json
 import math
 import random
 import sys
-import types
-from collections import Counter
 from pathlib import Path
 
-from google import genai
-
+import llm
 import promo_finder as pf  # reuses ask_model (same model, retries and quota stop) and clock
 from parser import load_all
 
@@ -40,22 +37,6 @@ Use every clip ID exactly once.
 
 CLIPS:
 {cards}"""
-
-
-class CountingModels:
-    """Wraps client.models only to add up the token usage the API reports.
-    It keeps the whole client: if the client object is garbage-collected, its connection closes."""
-    def __init__(self, client):
-        self.client, self.tokens = client, Counter()
-
-    def generate_content(self, **kwargs):
-        reply = self.client.models.generate_content(**kwargs)
-        usage = getattr(reply, "usage_metadata", None)
-        if usage:
-            self.tokens["input"] += usage.prompt_token_count or 0
-            self.tokens["output"] += usage.candidates_token_count or 0
-            self.tokens["total"] += usage.total_token_count or 0
-        return reply
 
 
 def load_episodes(out_dir):
@@ -103,12 +84,12 @@ def parse_ranking(raw, ids):
     return ranking if sorted(i for i, _ in ranking) == sorted(ids) else None
 
 
-def judge(client, group, cards, out_dir, name):
+def judge(group, cards, out_dir, name):
     """Ask the judge to rank one group. Retry once if the IDs are wrong, then fall back."""
     ids = [c["id"] for c in group]
     prompt = JUDGE_PROMPT.format(n=len(group), cards="\n\n".join(cards[i] for i in ids))
     for attempt in (1, 2):
-        raw = pf.ask_model(client, prompt)
+        raw = pf.ask_model(prompt)
         Path(out_dir, "raw", f"ranking_{name}_try{attempt}.json").write_text(raw, encoding="utf-8")
         ranking = parse_ranking(raw, ids)
         if ranking:
@@ -119,14 +100,11 @@ def judge(client, group, cards, out_dir, name):
     return [(c["id"], "fallback: ranked by weighted score (judge reply invalid)") for c in best_first]
 
 
-def rank_show(out_dir, client=None, seed=SEED, save_dir=None):
+def rank_show(out_dir, seed=SEED, save_dir=None):
     """Rank every usable candidate in out_dir; save ranked.json and final_rankings.csv
     in save_dir (default: out_dir). seed changes how clips are shuffled into groups."""
     save_dir = Path(save_dir or out_dir)
-    client = client or genai.Client()  # reads GEMINI_API_KEY from .env
-    counting = CountingModels(client)
-    client = types.SimpleNamespace(models=counting)
-    calls_before = pf.API_CALLS
+    calls_before, tokens_before = pf.API_CALLS, dict(llm.USAGE)
 
     candidates = load_candidates(out_dir)
     if not candidates:
@@ -146,14 +124,14 @@ def rank_show(out_dir, client=None, seed=SEED, save_dir=None):
 
     group_place, reasons, finalists = {}, {}, []
     for g, group in enumerate(groups, 1):
-        ranking = judge(client, group, cards, save_dir, f"round_1_group_{g:02d}")
+        ranking = judge(group, cards, save_dir, f"round_1_group_{g:02d}")
         for place, (cid, reason) in enumerate(ranking, 1):
             group_place[cid], reasons[cid] = place, reason
         finalists += [cid for cid, _ in ranking[:FINALISTS]]
 
     # Round 2: the top clips of every group, ranked the same way (not needed for one group).
     if n_groups > 1:
-        final = judge(client, [by_id[i] for i in finalists], cards, save_dir, "round_2_final")
+        final = judge([by_id[i] for i in finalists], cards, save_dir, "round_2_final")
         top = [cid for cid, _ in final]
         reasons.update(dict(final))  # finalists keep the final-round reason
     else:
@@ -183,7 +161,8 @@ def rank_show(out_dir, client=None, seed=SEED, save_dir=None):
         print(f"{r['rank']:>3}. {r['id']}  {pf.clock(r['start_time'])}-{pf.clock(r['end_time'])} "
               f"({r['duration']}s) {r['status']}\n       {r['judge_reason']}")
     print(f"\nAPI calls for ranking: {pf.API_CALLS - calls_before}")
-    print(f"Tokens: {dict(counting.tokens) if counting.tokens else 'not reported by the API'}")
+    tokens = {k: llm.USAGE[k] - tokens_before.get(k, 0) for k in ("input", "output")}
+    print(f"Tokens: {tokens if any(tokens.values()) else 'not reported by the API'}")
     print(f"Saved {Path(save_dir, 'ranked.json')} and {Path(save_dir, 'final_rankings.csv')}")
     return ranked
 

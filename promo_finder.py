@@ -1,6 +1,5 @@
-"""Step 3: ask Gemini for promo clips (as event numbers), then check and score them in plain Python."""
+"""Step 3: ask the model for promo clips (as event numbers), then check and score them in plain Python."""
 import json
-import os
 import re
 import sys
 import time
@@ -8,21 +7,18 @@ from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
-from dotenv import load_dotenv
-from google import genai
-from google.genai import types
-
+import llm  # the provider and model come from .env (see llm.py)
 from parser import load_all
 
-load_dotenv()  # reads GEMINI_API_KEY and GEMINI_MODEL from .env
-MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+MODEL = llm.MODEL
 MIN_SECONDS, MAX_SECONDS = 20, 60
 HOOK_WINDOW = 3.0         # the hook must start within 3s of the clip start
 CLIFF_WINDOW = 5.0        # at most 5s of clip may remain after the cliffhanger ends
 SILENT_WINDOW = 3.0       # look for a silent ending in the last 3s
 MAX_OVERLAP = 0.5         # two clips may share at most half of the shorter one
-PAUSE_SECONDS = 4
-MAX_TRIES = 3
+PAUSE_SECONDS = 4          # pause between episodes
+RETRY_WAITS = (15, 30, 60)  # seconds to wait before each retry (busy model, bad JSON, ...)
+MAX_TRIES = len(RETRY_WAITS) + 1
 # Weight of each 1-10 model score in the final 0-100 score.
 WEIGHTS = {"hook_score": 25, "cliffhanger_score": 25, "standalone_score": 20,
            "emotion_score": 15, "narrative_score": 10, "curiosity_score": 5}
@@ -92,13 +88,11 @@ class QuotaExhausted(Exception):
     """The model's quota is used up (429). Retrying won't help, so the whole run stops."""
 
 
-def is_quota_error(error):
-    """True for a 429 quota error from Gemini."""
-    text = str(error)
-    return "RESOURCE_EXHAUSTED" in text or "exceeded your current quota" in text
+class Overloaded(Exception):
+    """The model was still busy (503 'high demand') after every retry."""
 
 
-API_CALLS = 0  # every request sent to Gemini (including retries), for the end-of-run report
+API_CALLS = 0  # every request sent to the model (including retries), for the end-of-run report
 
 
 def build_prompt(episode):
@@ -108,24 +102,27 @@ def build_prompt(episode):
                          logline=episode["logline"], events=events)
 
 
-def ask_model(client, contents, tries=MAX_TRIES):
-    """Send a prompt (or a whole conversation) to Gemini and return the raw text reply.
-    Retries other errors (e.g. 503 high demand); a quota error stops at once."""
+def ask_model(messages, tries=MAX_TRIES, model=None):
+    """Send a prompt (str) or a conversation (list of {"role", "content"}) and return the reply text.
+    Retries other errors after 15s, 30s, 60s; a quota error stops at once."""
     global API_CALLS
-    config = types.GenerateContentConfig(response_mime_type="application/json")
+    if isinstance(messages, str):
+        messages = [{"role": "user", "content": messages}]
     for attempt in range(1, tries + 1):
         try:
             API_CALLS += 1
-            reply = client.models.generate_content(model=MODEL, contents=contents, config=config)
-            json.loads(reply.text)  # make sure it is valid JSON, else retry
-            return reply.text
+            text = llm.generate(messages, model)
+            json.loads(text)  # make sure it is valid JSON, else retry
+            return text
         except Exception as error:
             print(f"  attempt {attempt} failed: {str(error)[:120]}")
-            if is_quota_error(error):
+            if llm.is_quota_error(error):
                 raise QuotaExhausted(str(error)) from error  # no retry: it would waste calls
             if attempt == tries:
+                if llm.is_overloaded(error):
+                    raise Overloaded(str(error)) from error
                 raise
-            time.sleep(PAUSE_SECONDS * attempt)  # wait a bit longer each time
+            time.sleep(RETRY_WAITS[attempt - 1])  # wait longer each time
 
 
 def weighted_score(result):
@@ -234,7 +231,7 @@ def number_episodes(parsed):
     return episodes
 
 
-def repair(client, n, prompt, raw, results, events, out_dir):
+def repair(n, prompt, raw, results, events, out_dir, model):
     """One follow-up call for clips rejected only for their duration. Returns the new clips."""
     too_long_or_short = [(i, r) for i, r in enumerate(results, 1)
                          if r["status"] == "REJECTED" and r["reason"].startswith("duration")]
@@ -244,13 +241,13 @@ def repair(client, n, prompt, raw, results, events, out_dir):
                          f"must be {MIN_SECONDS}-{MAX_SECONDS}s" for i, r in too_long_or_short)
     print(f"  repair: asking for replacements of {len(too_long_or_short)} clip(s)")
     conversation = [  # the same conversation: our prompt, the model's reply, then our follow-up
-        types.Content(role="user", parts=[types.Part(text=prompt)]),
-        types.Content(role="model", parts=[types.Part(text=raw)]),
-        types.Content(role="user", parts=[types.Part(text=REPAIR_PROMPT.format(
-            min_s=MIN_SECONDS, max_s=MAX_SECONDS, problems=problems))]),
+        {"role": "user", "content": prompt},
+        {"role": "assistant", "content": raw},
+        {"role": "user", "content": REPAIR_PROMPT.format(
+            min_s=MIN_SECONDS, max_s=MAX_SECONDS, problems=problems)},
     ]
     try:
-        repair_raw = ask_model(client, conversation, tries=1)  # at most 1 extra call per episode
+        repair_raw = ask_model(conversation, tries=1, model=model)  # at most 1 extra call per episode
     except QuotaExhausted:
         raise  # quota is gone: stop the whole run
     except Exception as error:  # repair failed: keep the rejected clips and move on
@@ -260,14 +257,25 @@ def repair(client, n, prompt, raw, results, events, out_dir):
     return [dict(check(c, events), repaired=True) for c in json.loads(repair_raw)]
 
 
-def process(client, n, episode, out_dir="outputs"):
-    """Ask the model about one episode, check its answer, repair durations once, save both files."""
+def process(n, episode, out_dir="outputs"):
+    """Ask the model about one episode, check its answer, repair durations once, save both files.
+    If the model stays busy (503) after every retry, the episode is redone with LLM_FALLBACK_MODEL.
+    Returns the model that was used."""
     print(f"\n=== Episode {n} ({len(episode['events'])} events) ===")
     prompt = build_prompt(episode)
-    raw = ask_model(client, prompt)
+    model = MODEL
+    try:
+        raw = ask_model(prompt, model=model)
+    except Overloaded:
+        if not llm.FALLBACK_MODEL:
+            raise
+        model = llm.FALLBACK_MODEL
+        print(f"  {MODEL} still busy after all retries: using fallback model {model}")
+        raw = ask_model(prompt, model=model)
     Path(out_dir, "raw", f"episode_{n:02d}.json").write_text(raw, encoding="utf-8")
-    results = [dict(check(c, episode["events"]), repaired=False) for c in json.loads(raw)]
-    results += repair(client, n, prompt, raw, results, episode["events"], out_dir)  # rejected ones stay
+    results = [dict(check(c, episode["events"]), repaired=False, model=model) for c in json.loads(raw)]
+    results += [dict(r, model=model) for r in  # rejected ones stay
+                repair(n, prompt, raw, results, episode["events"], out_dir, model)]
     for number, result in enumerate(results, 1):
         result["clip"] = number
     reject_overlaps(results)
@@ -275,22 +283,24 @@ def process(client, n, episode, out_dir="outputs"):
         json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
     for result in results:
         show(result, episode["events"])
+    return model
 
 
-def run_all(client, episodes, wanted, out_dir="outputs", on_progress=None):
+def run_all(episodes, wanted, out_dir="outputs", on_progress=None):
     """Process each wanted episode with checkpointing; save and return the run log.
     on_progress(done, total, n, status) is called after each episode (used by the app)."""
     Path(out_dir, "raw").mkdir(parents=True, exist_ok=True)
     Path(out_dir, "checked").mkdir(parents=True, exist_ok=True)
-    print(f"Model: {MODEL}")
-    log = {"model": MODEL, "date": datetime.now().isoformat(timespec="seconds"), "episodes": {}}
+    print(f"Provider: {llm.PROVIDER} | model: {MODEL} | fallback: {llm.FALLBACK_MODEL or 'none'}")
+    log = {"provider": llm.PROVIDER, "model": MODEL, "fallback_model": llm.FALLBACK_MODEL,
+           "date": datetime.now().isoformat(timespec="seconds"), "episodes": {}}
     for done, n in enumerate(wanted, 1):
         if Path(out_dir, "checked", f"episode_{n:02d}.json").exists():  # checkpoint: already done
             log["episodes"][n] = "skipped (already done)"
         else:
             try:
-                process(client, n, episodes[n], out_dir)
-                log["episodes"][n] = "ok"
+                used = process(n, episodes[n], out_dir)
+                log["episodes"][n] = "ok" if used == MODEL else f"ok (fallback model {used})"
             except QuotaExhausted as error:  # quota used up: log it and stop the whole run
                 print(f"  Episode {n}: QUOTA EXHAUSTED for {MODEL}. Stopping the run.")
                 log["episodes"][n] = f"failed: quota exhausted: {error}"
@@ -342,5 +352,5 @@ if __name__ == "__main__":
     # Usage: python promo_finder.py 1 25 50   or   python promo_finder.py all
     episodes = number_episodes(load_all())
     wanted = sorted(episodes) if sys.argv[1:] == ["all"] else [int(n) for n in sys.argv[1:]]
-    run_all(genai.Client(), episodes, wanted)  # genai.Client() reads GEMINI_API_KEY from the environment
+    run_all(episodes, wanted)  # provider, model and key come from .env (see llm.py)
     summary()

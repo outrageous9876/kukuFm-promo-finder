@@ -8,8 +8,8 @@ DIRECTION_TYPES = {"CAMERA", "ACTION", "SOUND FX"}
 
 # **NAME (Emotion):**  or  **NAME:**
 HEADER_RE = re.compile(r"^\*\*(.+?)(?:\s*\((.*)\))?:\*\*$")
-# Start: (00:11.30) | End: (00:13.10)
-TIME_RE = re.compile(r"^Start:\s*\(([\d:.]+)\)\s*\|\s*End:\s*\(([\d:.]+)\)$")
+# Start: (00:11.30) | End: (00:13.10)   (any letter case, e.g. "start:" / "END:")
+TIME_RE = re.compile(r"^Start:\s*\(([\d:.]+)\)\s*\|\s*End:\s*\(([\d:.]+)\)$", re.I)
 # Header fields like "EPISODE NUMBER: Episode 1"
 FIELD_RE = re.compile(r"^(EPISODE NUMBER|EPISODE LOGLINE|CONTINUITY NOTES):\s*(.*)$")
 # Layout lines we expect and simply skip: SCENE 01, Scene heading:, --- SCRIPT START ---, ...
@@ -55,7 +55,7 @@ def parse_episode(path):
             current["end"] = to_seconds(time.group(2))
         elif not line or LAYOUT_RE.match(line):
             continue  # blank or layout line: nothing to store
-        elif line.startswith("Start:"):
+        elif line.lower().startswith("start:"):
             errors.append((line_no, raw))  # looked like a timestamp but didn't match
         elif current and current["start"] is not None:
             current["text"] = (current["text"] + " " + line).strip().strip('"')

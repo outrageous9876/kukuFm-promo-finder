@@ -6,14 +6,12 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
-from dotenv import load_dotenv
-from google import genai
 
+import llm  # reads .env: provider, model and API key
 import rank
 from promo_finder import clock, describe
 from run import run_show
 
-load_dotenv()
 st.set_page_config(page_title="Promo Finder", layout="wide")
 st.title("Microdrama promo finder")
 
@@ -106,8 +104,13 @@ def table_with_script(rows, episodes, key):
 # ---------- Sidebar: choose existing results, or run a new show ----------
 st.sidebar.header("Results")
 mode = st.sidebar.radio("Source", ["Existing results", "Upload a ZIP"])
-api_key = os.getenv("GEMINI_API_KEY") or st.sidebar.text_input(
-    "Gemini API key (not saved)", type="password")
+st.sidebar.caption(f"Model: {llm.PROVIDER} / {llm.MODEL}")
+key_name = llm.api_key_name()  # e.g. GEMINI_API_KEY, depending on LLM_PROVIDER
+if not os.getenv(key_name):
+    typed_key = st.sidebar.text_input(f"{key_name} (not saved)", type="password")
+    if typed_key:
+        llm.set_api_key(typed_key)  # kept in memory only
+api_ready = llm.has_api_key()
 folder = None
 
 if mode == "Existing results":
@@ -118,17 +121,17 @@ if mode == "Existing results":
         st.sidebar.write("No results in outputs/ yet.")
 else:
     upload = st.sidebar.file_uploader("Show ZIP (screenplay .txt files)", type="zip")
-    if upload and st.sidebar.button("Run", disabled=not api_key):
+    if upload and st.sidebar.button("Run", disabled=not api_ready):
         bar = st.progress(0.0, text="Starting...")
         with tempfile.TemporaryDirectory() as tmp:
             zip_path = Path(tmp, upload.name)
             zip_path.write_bytes(upload.getvalue())
-            folder = run_show(zip_path, genai.Client(api_key=api_key), name=Path(upload.name).stem,
+            folder = run_show(zip_path, name=Path(upload.name).stem,
                               on_progress=lambda done, total, n, status: bar.progress(
                                   done / total, text=f"Episode {n}: {status[:60]} ({done}/{total})"))
         st.session_state["ran"] = str(folder)
-    if not api_key:
-        st.sidebar.warning("Add GEMINI_API_KEY to .env or type it above to run.")
+    if not api_ready:
+        st.sidebar.warning(f"Add {key_name} to .env or type it above to run.")
     folder = st.session_state.get("ran")
 
 if not folder:

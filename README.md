@@ -5,7 +5,8 @@ first 3 seconds, end on a cliffhanger and make sense to someone who has never se
 
 How it works:
 1. `parser.py` turns each screenplay `.txt` into timed events (camera, action, sound, dialogue).
-2. `promo_finder.py` sends each episode to Gemini as numbered events. The model picks clips
+2. `promo_finder.py` sends each episode to the AI model as numbered events (Gemini by default;
+   see "Swap the model" for OpenAI-compatible APIs and Anthropic). The model picks clips
    **by event number only**. It never writes timestamps, so it can't invent them.
 3. Plain Python then looks up the real timestamps and checks the clips: duration 20–60s, hook
    within 3s of the start, cliffhanger near the end, silent endings, and overlaps between clips.
@@ -28,11 +29,28 @@ copy .env.example .env      (macOS/Linux: cp .env.example .env)
 
 Put your key in `.env`:
 ```
+LLM_PROVIDER=gemini
+LLM_MODEL=gemini-3.5-flash-lite
 GEMINI_API_KEY=your-key-here
-GEMINI_MODEL=gemini-3.5-flash-lite
 ```
 
-**Swap the model:** change the `GEMINI_MODEL` line in `.env`. Nothing else needs to change.
+### Swap the model
+
+Everything that talks to the AI is in `llm.py`; the rest of the code doesn't know which
+provider it uses. Choose it in `.env`, nothing else needs to change:
+
+| `.env` line | What it does |
+|---|---|
+| `LLM_PROVIDER=gemini` / `openai` / `anthropic` | Which API to call (default `gemini`) |
+| `LLM_MODEL=<model name>` | The model, e.g. `gemini-3.5-flash-lite` or `claude-opus-5-5`. Required for `openai` |
+| `LLM_FALLBACK_MODEL=<model name>` | Optional, same provider: used for an episode only if the main model is still busy (503) after all retries |
+| `GEMINI_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | The key for the provider you chose |
+| `OPENAI_BASE_URL=<url>` | Optional, `openai` only: any OpenAI-compatible API, e.g. Groq (`https://api.groq.com/openai/v1`) or OpenRouter |
+
+Old `.env` files with only `GEMINI_MODEL=...` still work. Provider packages are imported only
+when used, so you need only the package for your provider (`requirements.txt` lists all three).
+Retries: a busy model (503) is retried after 15s, 30s and 60s; a quota error (429) stops the run
+at once, and running again later resumes where it stopped.
 
 ## Run
 
