@@ -1,0 +1,15 @@
+# Confidential screenplays and anything derived from them
+data/
+outputs/
+*.zip
+# Prompt / scratch text files that quote script lines
+step*.txt
+check.txt
+prompt*.txt
+notes*.txt
+# ...but keep the dependency list
+!requirements.txt
+# Secrets
+.env
+# Python cache
+__pycache__/
